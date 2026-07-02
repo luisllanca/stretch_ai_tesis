@@ -2,13 +2,18 @@
 Offline DynaMem — Orbbec dataset, con export de bounding boxes en las consultas
 
 Es una variante de offline_dynamem.py que además de la posición 3D de cada consulta,
-exporta un PNG del frame usado con el bounding box del objeto detectado dibujado
-encima (o un aviso si no hubo detección y se usó solo similitud de features).
+exporta:
+  - un PNG del frame usado con el bounding box del objeto detectado dibujado encima
+    (o un aviso si no hubo detección y se usó solo similitud de features);
+  - un PNG del mapa 2D de la sesión con la posición del objeto consultado proyectada
+    y pintada de un color distintivo.
 
 También permite elegir la carpeta de salida en cada lanzamiento con --output-dir.
-Dentro de esa carpeta, las cosas "pesadas" (rgb*.jpg/npy, depth*.npy, intrinsics*.npy,
-pose*.npy, mapa.pkl, mapa_2d.png, bbox_*.png) quedan en una subcarpeta frames/, mientras
-que query_results.json (el resultado de las consultas) queda al mismo nivel que frames/.
+Dentro de esa carpeta, las cosas "pesadas" de la captura (rgb*.jpg/npy, depth*.npy,
+intrinsics*.npy, pose*.npy, mapa.pkl, mapa_2d.png) quedan en frames/; los PNGs con
+bbox de cada consulta van en consultas/ (para revisarlos fácil, sin mezclarse con
+el resto); y los mapas 2D por objeto van en mapas/. query_results.json queda al
+mismo nivel que estas carpetas.
 
 Estructura de salida:
     <output_dir>/
@@ -17,7 +22,10 @@ Estructura de salida:
             rgb1.jpg  rgb1.npy  depth1.npy  intrinsics1.npy  pose1.npy  ...
             mapa.pkl
             mapa_2d.png
+        consultas/
             bbox_<consulta>_frame<N>.png
+        mapas/
+            mapa_<consulta>.png
 
 Estructura esperada del dataset (igual que offline_dynamem.py):
     <data_dir>/
@@ -43,7 +51,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib
 matplotlib.use("Agg")  # sin display
@@ -302,10 +310,10 @@ def _select_detection_bbox(
     return None
 
 
-def export_bbox_frame(voxel_map, text: str, obs_id: int, frames_dir: Path) -> Optional[str]:
+def export_bbox_frame(voxel_map, text: str, obs_id: int, queries_dir: Path) -> Optional[str]:
     """
     Vuelve a correr el detector sobre el frame donde DynaMem localizó `text` y
-    guarda en frames_dir un PNG con el bounding box dibujado (o un aviso si no
+    guarda en queries_dir un PNG con el bounding box dibujado (o un aviso si no
     hubo detección y la localización vino solo de similitud de features).
     """
     if voxel_map.detection_model is None:
@@ -340,13 +348,72 @@ def export_bbox_frame(voxel_map, text: str, obs_id: int, frames_dir: Path) -> Op
             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2, cv2.LINE_AA,
         )
 
-    png_path = frames_dir / f"bbox_{_sanitize_filename(text)}_frame{obs_id}.png"
+    png_path = queries_dir / f"bbox_{_sanitize_filename(text)}_frame{obs_id}.png"
     cv2.imwrite(str(png_path), vis)
     return str(png_path)
 
 
-def _localize(voxel_map, text: str, frames_dir: Path):
-    """Localiza el texto, exporta el PNG con bbox y devuelve (pos, obs_id, png_path)."""
+# Color distintivo (RGB 0-1) para pintar el objeto consultado sobre el mapa 2D
+QUERY_MARKER_COLOR = "#ff2fb0"  # magenta/fucsia, contrasta con obstáculos/explorado
+
+
+def export_map_with_object(voxel_map, text: str, pos: List[float], maps_dir: Path) -> str:
+    """
+    Genera un PNG del mapa 2D (obstáculos + área explorada) de la sesión completa,
+    con la posición xy del objeto consultado proyectada a la grilla y pintada con
+    QUERY_MARKER_COLOR para poder verla fácilmente.
+    """
+    obstacles, explored = voxel_map.get_2d_map()
+    obs_np = obstacles.cpu().numpy()
+    exp_np = explored.cpu().numpy()
+
+    # Recorte al área explorada, igual que el mapa_2d.png general
+    rows = np.any(exp_np > 0, axis=1)
+    cols = np.any(exp_np > 0, axis=0)
+    r0, c0 = 0, 0
+    if rows.any():
+        r0, r1 = np.where(rows)[0][[0, -1]]
+        c0, c1 = np.where(cols)[0][[0, -1]]
+        pad = 5
+        r0, r1 = max(0, r0 - pad), min(obs_np.shape[0], r1 + pad)
+        c0, c1 = max(0, c0 - pad), min(obs_np.shape[1], c1 + pad)
+        obs_np = obs_np[r0:r1, c0:c1]
+        exp_np = exp_np[r0:r1, c0:c1]
+
+    # Fondo: explorado en gris claro, obstáculos en gris oscuro, resto blanco
+    base = np.ones((*obs_np.shape, 3), dtype=np.float32)
+    base[exp_np > 0] = [0.82, 0.82, 0.82]
+    base[obs_np > 0] = [0.25, 0.25, 0.25]
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.imshow(base, origin="lower")
+
+    grid_xy = voxel_map.xy_to_grid_coords(np.array(pos[:2], dtype=np.float32))
+    if grid_xy is not None:
+        gx, gy = float(grid_xy[0]), float(grid_xy[1])
+        ax.scatter(
+            gy - c0, gx - r0,
+            c=QUERY_MARKER_COLOR, s=220, marker="*",
+            edgecolors="black", linewidths=1.2, zorder=5, label=text,
+        )
+        ax.legend(loc="upper right")
+        ax.set_title(f"Mapa 2D — '{text}'")
+    else:
+        ax.set_title(f"Mapa 2D — '{text}' (posición fuera de la grilla)")
+
+    ax.axis("off")
+    plt.tight_layout()
+    map_path = maps_dir / f"mapa_{_sanitize_filename(text)}.png"
+    plt.savefig(map_path)
+    plt.close(fig)
+    return str(map_path)
+
+
+def process_query(
+    voxel_map, text: str, queries_dir: Path, maps_dir: Path
+) -> Optional[Dict[str, Any]]:
+    """Localiza el texto y exporta sus dos artefactos visuales: el PNG con bbox
+    (en queries_dir) y el mapa 2D con el objeto proyectado (en maps_dir)."""
     result = voxel_map.localize_with_feature_similarity(text, debug=True, return_debug=True)
     if result is None:
         return None
@@ -357,22 +424,34 @@ def _localize(voxel_map, text: str, frames_dir: Path):
     pos = np.round(
         target_point.numpy() if hasattr(target_point, "numpy") else np.array(target_point), 3
     ).tolist()
-    png_path = export_bbox_frame(voxel_map, text, obs_id, frames_dir)
-    return pos, obs_id, png_path
+
+    bbox_path = export_bbox_frame(voxel_map, text, obs_id, queries_dir)
+    map_path = export_map_with_object(voxel_map, text, pos, maps_dir)
+
+    return {
+        "position": pos,
+        "frame_id": obs_id,
+        "bbox_image": bbox_path,
+        "map_image": map_path,
+    }
 
 
-def query_objects(voxel_map, queries: List[str], output_dir: Path, frames_dir: Path) -> dict:
-    """Localiza una lista de objetos, exporta sus PNGs con bbox y guarda resultados en JSON."""
+def query_objects(
+    voxel_map, queries: List[str], output_dir: Path, queries_dir: Path, maps_dir: Path
+) -> dict:
+    """Localiza una lista de objetos, exporta sus PNGs (bbox + mapa) y guarda resultados en JSON."""
     results = {}
     for text in queries:
-        found = _localize(voxel_map, text, frames_dir)
+        found = process_query(voxel_map, text, queries_dir, maps_dir)
         if found is None:
             print(f"  '{text}': no encontrado")
             results[text] = None
         else:
-            pos, obs_id, png_path = found
-            print(f"  '{text}': pos={pos}  frame={obs_id}  bbox={png_path}")
-            results[text] = {"position": pos, "frame_id": obs_id, "bbox_image": png_path}
+            print(
+                f"  '{text}': pos={found['position']}  frame={found['frame_id']}  "
+                f"bbox={found['bbox_image']}  mapa={found['map_image']}"
+            )
+            results[text] = found
     json_path = output_dir / "query_results.json"
     with open(json_path, "w") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
@@ -380,7 +459,7 @@ def query_objects(voxel_map, queries: List[str], output_dir: Path, frames_dir: P
     return results
 
 
-def query_loop(voxel_map, output_dir: Path, frames_dir: Path):
+def query_loop(voxel_map, output_dir: Path, queries_dir: Path, maps_dir: Path):
     print("\n" + "=" * 60)
     print("Mapa listo. Escribe un objeto para localizarlo en el mapa.")
     print("Escribe 'salir' para terminar.")
@@ -393,17 +472,17 @@ def query_loop(voxel_map, output_dir: Path, frames_dir: Path):
             break
         if not text or text.lower() in ("salir", "quit", "exit", "q"):
             break
-        found = _localize(voxel_map, text, frames_dir)
+        found = process_query(voxel_map, text, queries_dir, maps_dir)
         if found is None:
             print(f"  No se encontró '{text}' en el mapa.")
             session[text] = None
         else:
-            pos, obs_id, png_path = found
             print(f"  '{text}' encontrado:")
-            print(f"    Posición 3D: {pos}")
-            print(f"    Frame ID:    {obs_id}")
-            print(f"    BBox PNG:    {png_path}")
-            session[text] = {"position": pos, "frame_id": obs_id, "bbox_image": png_path}
+            print(f"    Posición 3D: {found['position']}")
+            print(f"    Frame ID:    {found['frame_id']}")
+            print(f"    BBox PNG:    {found['bbox_image']}")
+            print(f"    Mapa PNG:    {found['map_image']}")
+            session[text] = found
     if session:
         json_path = output_dir / "query_results.json"
         with open(json_path, "w") as f:
@@ -416,9 +495,11 @@ def main():
     parser.add_argument("--data-dir",  default="../robot_20251024_074000",
                         help="Carpeta raíz del dataset")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR,
-                        help="Carpeta de salida. query_results.json queda aquí; todo lo demás "
-                             "(rgb/depth/npy por frame, mapa.pkl, mapa_2d.png, PNGs de bbox) "
-                             "va en <output-dir>/frames/")
+                        help="Carpeta de salida. query_results.json queda aquí; los archivos "
+                             "crudos de captura (rgb/depth/npy por frame, mapa.pkl, mapa_2d.png) "
+                             "van en <output-dir>/frames/; los PNGs con bbox de cada consulta van "
+                             "en <output-dir>/consultas/; los mapas 2D por objeto van en "
+                             "<output-dir>/mapas/")
     parser.add_argument("--fx", type=float, default=DEFAULT_FX)
     parser.add_argument("--fy", type=float, default=DEFAULT_FY)
     parser.add_argument("--cx", type=float, default=DEFAULT_CX)
@@ -440,9 +521,15 @@ def main():
     # 0. Preparar carpetas de salida
     output_dir = Path(args.output_dir)
     frames_dir = output_dir / "frames"
+    queries_dir = output_dir / "consultas"
+    maps_dir = output_dir / "mapas"
     frames_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Salida:\n  consultas          -> {output_dir}/query_results.json")
-    print(f"  frames/mapa/bboxes  -> {frames_dir}/")
+    queries_dir.mkdir(parents=True, exist_ok=True)
+    maps_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Salida:\n  query_results.json -> {output_dir}/query_results.json")
+    print(f"  captura cruda/mapa  -> {frames_dir}/")
+    print(f"  bbox por consulta   -> {queries_dir}/")
+    print(f"  mapas 2D por objeto -> {maps_dir}/")
 
     # 1. Cargar dataset
     rgbs_orig, depths_orig, poses = load_dataset(args.data_dir)
@@ -512,9 +599,9 @@ def main():
     if args.queries:
         query_list = [q.strip() for q in args.queries.split(",") if q.strip()]
         print(f"\nConsultando {len(query_list)} objetos...")
-        query_objects(voxel_map, query_list, output_dir, frames_dir)
+        query_objects(voxel_map, query_list, output_dir, queries_dir, maps_dir)
     else:
-        query_loop(voxel_map, output_dir, frames_dir)
+        query_loop(voxel_map, output_dir, queries_dir, maps_dir)
 
     print("Fin.")
 
