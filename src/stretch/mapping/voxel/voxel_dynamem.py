@@ -331,7 +331,7 @@ class SparseVoxelMap(SparseVoxelMapBase):
         """
         # Log input data
         if not os.path.exists(self.log):
-            os.mkdir(self.log)
+            os.makedirs(self.log)
         self.obs_count += 1
 
         cv2.imwrite(self.log + "/rgb" + str(self.obs_count) + ".jpg", rgb[:, :, [2, 1, 0]])
